@@ -7,10 +7,14 @@
 #include <vector>
 #include <cmath>
 #include <type_traits>
-
+#include <utility>
+#include <filesystem>
+#include <fstream>
+#include <format>
 struct BencodeValue {
     using List = std::vector<BencodeValue>;
-    std::variant<std::int64_t, std::string, List> value;
+    using Dict = std::vector<std::pair<std::string, BencodeValue>>;
+    std::variant<std::int64_t, std::string, List, Dict> value;
 };
 
 std::string parse_byte_string(std::string_view input, std::size_t& pos) {
@@ -55,11 +59,11 @@ std::int64_t parse_integer(std::string_view input, std::size_t& pos) {
 }
 
 BencodeValue::List parse_list(std::string_view, std::size_t&);
-
+BencodeValue::Dict parse_dictionary(std::string_view, std::size_t&);
 BencodeValue parse_value(std::string_view, std::size_t&);
 
+
 BencodeValue parse_value(std::string_view input, std::size_t& pos) {
-    BencodeValue result;
     std::size_t input_size = input.size();
     
     if (pos >= input_size)
@@ -74,9 +78,51 @@ BencodeValue parse_value(std::string_view input, std::size_t& pos) {
     else if (input[pos] >= '0' && input[pos] <= '9') 
         return BencodeValue{parse_byte_string(input, pos)}; 
 
+    else if (input[pos] == 'd') 
+        return BencodeValue{parse_dictionary(input, pos)};
+
     else 
         throw std::invalid_argument("Invalid format of bencode data type");
 } 
+
+BencodeValue::Dict parse_dictionary(std::string_view input, std::size_t& pos) {
+    BencodeValue::Dict result;
+    std::string key;
+    std::size_t input_size = input.size();
+    size_t cursor = pos + 1;
+
+
+    while (cursor < input_size) {
+        if (input[cursor] == 'e')
+            break;
+        
+        try {
+            key = parse_byte_string(input, cursor);
+        } catch (std::invalid_argument& e) {
+            throw std::invalid_argument("Dictionary key must be a string");
+        } catch (std::range_error& e) {
+            throw std::invalid_argument("Invalid format of key");
+        }
+
+        BencodeValue value = parse_value(input, cursor);
+        
+        if (!result.empty() && result.back().first == key) 
+            throw std::invalid_argument("This key already exists");
+
+        if (!result.empty() && result.back().first > key)
+            throw std::range_error("Keys must follow in lexicographical order");
+
+        result.emplace_back(std::make_pair(std::move(key), std::move(value)));
+    }
+
+    if (cursor >= input_size || input[cursor] != 'e') {
+        throw std::invalid_argument("Invalid format of bencode list");
+    }
+
+    pos = cursor + 1;
+    return result;
+}
+
 
 BencodeValue::List parse_list(std::string_view input, std::size_t& pos) {
     BencodeValue::List result;
@@ -91,11 +137,7 @@ BencodeValue::List parse_list(std::string_view input, std::size_t& pos) {
         if (input[cursor] == 'e')
             break;
 
-        try {
         result.emplace_back(parse_value(input, cursor));
-        } catch(const std::exception& e) {
-            throw e;
-        }
     }
 
     if (cursor >= input_size || input[cursor] != 'e') {
@@ -105,6 +147,43 @@ BencodeValue::List parse_list(std::string_view input, std::size_t& pos) {
     return result;
 } 
 
+BencodeValue parse_document(std::string_view input) {
+    BencodeValue result;
+    std::size_t pos = 0;
+    std::size_t input_size = input.size();
+
+    result = parse_value(input, pos);
+
+    if (pos != input_size) 
+        throw std::invalid_argument("Invalid format of bencode file");
+
+    return result;
+}
+
+std::string read_binary_file(const std::filesystem::path& path) {
+    std::ifstream fin(path, std::ios::binary | std::ios::ate);
+    if (!fin.is_open()) {
+        throw std::runtime_error(
+         "Failed to open file " + std::string(path)
+        );
+    }
+
+    auto file_size = fin.tellg();
+    if (file_size == std::streampos(-1))
+        throw std::runtime_error("Error tellg in a file " + std::string(path));
+
+    std::string input(file_size, '\0');
+
+    fin.seekg(0);
+    if (!fin.good())
+        throw std::runtime_error("Error seekg in a file " + std::string(path));
+
+
+    fin.read(input.data(), file_size);
+    
+    fin.close();
+    return input;
+}
 
 void print_value(const BencodeValue& item) {
     std::visit([](const auto& value) {
@@ -114,18 +193,54 @@ void print_value(const BencodeValue& item) {
             for (const auto& child : value)
                 print_value(child);
             std::cout << " ]" << std::endl;
-        } else {
+        }
+        else if constexpr (std::is_same_v<Value, BencodeValue::Dict>) {
+            std::cout << "{ ";
+            for (const auto& pair : value) {
+                std::cout << pair.first << ": ";
+                print_value(pair.second);
+            }
+            std::cout << " }" << std::endl;
+        }
+        else {
             std::cout << value << '\n';
         }
     }, item.value);
 }
 
+const BencodeValue& require_key_value(const BencodeValue::Dict& dict, std::string_view key) {
+    for (const auto& [name, value] : dict) {
+        if (name == key) return value;
+    }
+
+    throw std::invalid_argument("Key " + std::string(key) + " does not exist");
+}
+
+const BencodeValue& get_field_from_dict(const BencodeValue& document, std::string_view key) {
+    const auto* dict = std::get_if<BencodeValue::Dict>(&document.value);
+    if (dict == nullptr)
+        throw std::invalid_argument("Expected a dictionary while looking up '" + std::string(key) + "'"); 
+    const BencodeValue& value = require_key_value(*dict, key);
+    return value;
+}
+
+std::string extract_torrent_name(const BencodeValue& document) {
+    const BencodeValue& info_dict = get_field_from_dict(document, "info");
+    const BencodeValue& name = get_field_from_dict(info_dict, "name");
+
+    const auto* name_str = std::get_if<std::string>(&name.value);
+    if (name_str == nullptr)
+        throw std::invalid_argument("Field 'info.name' must be a string"); 
+    return *name_str;
+}
+
+
+
 int main(int argc, char* argv[]) {
     size_t pos = 0;
     // std::cout << parse_byte_string("3:cati7e", pos) << "\tpos: "<< pos <<  std::endl;
-    BencodeValue::List res = parse_list("ll3:cati7eeli5eee", pos);
-    std::cout << "length: " << res.size() << std::endl;
-    for (const auto& a : res) {
-        print_value(a);
-    }
+    std::string input = read_binary_file("example.bin");
+    // auto res = parse_document(std::string_view(input));
+    std::cout << extract_torrent_name(parse_document(input)) << std::endl;
+    // print_value(res);
 }
